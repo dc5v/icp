@@ -1,0 +1,180 @@
+@ECHO OFF
+SETLOCAL EnableDelayedExpansion
+
+SET IS_X64=0
+SET EXEC=opcda-cli
+SET BUILD_DIR=build
+SET OBJ_DIR=build\obj
+SET LIBS_DIR=build\libs
+SET LOG_FILE=%BUILD_DIR%\build_log.txt
+SET REGSVR_LIST=%BUILD_DIR%\regsvr32.txt
+SET TEMP_FILE=%TEMP%\dllcheck.tmp
+
+SET BUILD_TOOL_DIR=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build
+
+IF NOT EXIST %BUILD_DIR% MKDIR %BUILD_DIR%
+IF NOT EXIST %OBJ_DIR% MKDIR %OBJ_DIR%
+IF NOT EXIST %LIBS_DIR% MKDIR %LIBS_DIR%
+
+FOR %%A IN (%*) DO (
+    IF "%%A"=="-64" SET IS_X64=1
+)
+
+ECHO Build started at %TIME% > %LOG_FILE%
+
+IF "%IS_X64%"=="1" (
+    ECHO Initializing x64 environment... >> %LOG_FILE%
+    CALL "%BUILD_TOOL_DIR%\vcvars64.bat" > nul 2>&1
+    SET OUTPUT_NAME="%BUILD_DIR%\%EXEC%.exe"
+    SET OPC_LIB="libs\x64\opccomn_x64.lib" "libs\x64\opcda_x64.lib" "libs\x64\shlwapi_x64.lib"
+    SET SRC_DLL_PATH="C:\Program Files\Common Files\OPC Foundation\Binary"
+    ECHO Using x64 platform >> %LOG_FILE%
+) ELSE (
+    ECHO Initializing x86 environment... >> %LOG_FILE%
+    CALL "%BUILD_TOOL_DIR%\vcvars32.bat" > nul 2>&1
+    SET OUTPUT_NAME="%BUILD_DIR%\%EXEC%-x86.exe"
+    SET OPC_LIB="libs\x86\opccomn_x86.lib" "libs\x86\opcda_x86.lib" "libs\x86\shlwapi_x86.lib"
+    SET SRC_DLL_PATH="C:\Program Files (x86)\Common Files\OPC Foundation\Binary"
+    ECHO Using x86 platform >> %LOG_FILE%
+)
+
+ECHO Building %EXEC%... >> %LOG_FILE%
+
+REM 빌드 명령을 로그 파일로 리디렉션
+cl /EHsc /MD /std:c++17 /W4 /D "_WINDOWS" /D "_CONSOLE" /D "_UNICODE" /D "UNICODE" ^
+    /Zc:wchar_t /I"C:\Program Files (x86)\Common Files\OPC Foundation\Include" ^
+    /I"C:\Program Files (x86)\Common Files\OPC Foundation\Include\opcda" /Fo"%OBJ_DIR%\\" ^
+    *.cpp /link %OPC_LIB% ole32.lib oleaut32.lib uuid.lib /NODEFAULTLIB:LIBCMT /OUT:%OUTPUT_NAME% >> %LOG_FILE% 2>&1
+
+IF %ERRORLEVEL% NEQ 0 (
+    ECHO Build failed with error code %ERRORLEVEL%
+    ECHO See %LOG_FILE% for details
+    TYPE %LOG_FILE%
+    GOTO :END
+)
+
+ECHO Build successful >> %LOG_FILE%
+
+REM OPC Foundation Binary 디렉토리에서 모든 DLL 및 TLB 파일 목록 가져오기
+ECHO Getting DLL and TLB files from %SRC_DLL_PATH%... >> %LOG_FILE%
+DIR /B %SRC_DLL_PATH%\*.dll %SRC_DLL_PATH%\*.tlb > %TEMP_FILE%
+
+REM regsvr32.txt 파일 생성 준비
+ECHO # COM 등록 상태 감지 결과 > %REGSVR_LIST%
+ECHO # 생성 시간: %DATE% %TIME% >> %REGSVR_LIST%
+ECHO. >> %REGSVR_LIST%
+ECHO [자동 COM 등록 필요 DLL 목록] >> %REGSVR_LIST%
+
+REM TLB 파일 목록 준비
+ECHO. >> %REGSVR_LIST%
+ECHO [타입 라이브러리(TLB) 파일 목록] >> %REGSVR_LIST%
+
+REM DLL과 TLB 파일 분류
+FOR /F "tokens=*" %%F IN (%TEMP_FILE%) DO (
+    SET FILE_NAME=%%F
+    SET FILE_EXT=!FILE_NAME:~-4!
+    
+    IF "!FILE_EXT!"==".dll" (
+        REM DLL 파일 검사
+        ECHO Checking %%F for COM registration requirements... >> %LOG_FILE%
+        
+        REM DLL COM 서버 여부 확인 (간접적 방법)
+        DUMPBIN /EXPORTS %SRC_DLL_PATH%\%%F | FINDSTR /C:"DllRegisterServer" /C:"DllUnregisterServer" > NUL
+        IF !ERRORLEVEL! EQU 0 (
+            ECHO %%F >> %REGSVR_LIST%
+            ECHO Identified %%F as COM server DLL >> %LOG_FILE%
+            
+            REM 필요한 파일 복사
+            SET SRC_FILE=%SRC_DLL_PATH%\%%F
+            SET DEST_FILE=%LIBS_DIR%\%%F
+            CALL :CopyFileWithVersionCheck "!SRC_FILE!" "!DEST_FILE!"
+        ) ELSE (
+            ECHO Checking %%F for dependencies... >> %LOG_FILE%
+            SET SRC_FILE=%SRC_DLL_PATH%\%%F
+            SET DEST_FILE=%LIBS_DIR%\%%F
+            CALL :CopyFileWithVersionCheck "!SRC_FILE!" "!DEST_FILE!"
+        )
+    ) ELSE IF "!FILE_EXT!"==".tlb" (
+        ECHO %%F >> %REGSVR_LIST%
+        ECHO Identified %%F as type library >> %LOG_FILE%
+        
+        REM TLB 파일 복사
+        SET SRC_FILE=%SRC_DLL_PATH%\%%F
+        SET DEST_FILE=%LIBS_DIR%\%%F
+        CALL :CopyFileWithVersionCheck "!SRC_FILE!" "!DEST_FILE!"
+    )
+)
+
+REM 매니페스트 생성 및 적용
+ECHO. >> %LOG_FILE%
+ECHO Creating Registration-Free COM manifest... >> %LOG_FILE%
+
+REM 매니페스트 헤더 생성
+> "%BUILD_DIR%\%EXEC%.manifest" (
+    ECHO ^<?xml version="1.0" encoding="UTF-8" standalone="yes"?^>
+    ECHO ^<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"^>
+    ECHO   ^<assemblyIdentity type="win32" name="%EXEC%" version="1.0.0.0" /^>
+)
+
+REM 복사된 DLL 중 COM 서버 DLL만 매니페스트에 추가
+FOR /F "tokens=*" %%F IN ('DIR /B %LIBS_DIR%\*.dll') DO (
+    DUMPBIN /EXPORTS %LIBS_DIR%\%%F | FINDSTR /C:"DllRegisterServer" /C:"DllUnregisterServer" > NUL
+    IF !ERRORLEVEL! EQU 0 (
+        ECHO   ^<file name="%%F"^> >> "%BUILD_DIR%\%EXEC%.manifest"
+        ECHO     ^<comClass description="COM Server Component" clsid="*" threadingModel="Apartment" /^> >> "%BUILD_DIR%\%EXEC%.manifest"
+        ECHO   ^</file^> >> "%BUILD_DIR%\%EXEC%.manifest"
+    )
+)
+
+REM 매니페스트 닫기
+ECHO ^</assembly^> >> "%BUILD_DIR%\%EXEC%.manifest"
+
+mt.exe -manifest "%BUILD_DIR%\%EXEC%.manifest" -outputresource:%OUTPUT_NAME%;1 >> %LOG_FILE% 2>&1
+IF %ERRORLEVEL% EQU 0 (
+    ECHO Manifest applied successfully >> %LOG_FILE%
+) ELSE (
+    ECHO Failed to apply manifest >> %LOG_FILE%
+)
+
+ECHO. >> %LOG_FILE%
+ECHO Build completed at %TIME% >> %LOG_FILE%
+ECHO COM 등록 대상 파일 목록이 %REGSVR_LIST%에 생성되었습니다.
+ECHO 빌드 완료
+
+GOTO :END
+
+:CopyFileWithVersionCheck
+SET SRC_FILE=%~1
+SET DEST_FILE=%~2
+
+IF NOT EXIST "%DEST_FILE%" (
+    ECHO Copying %~nx1 to %LIBS_DIR% >> %LOG_FILE%
+    COPY /Y "%SRC_FILE%" "%DEST_FILE%" > nul
+    GOTO :EOF
+)
+
+FOR /F "tokens=2 delims==" %%I IN ('wmic datafile where name^="%SRC_FILE:\=\\%" get Version /value 2^>nul') DO (
+    SET SRC_VER=%%I
+)
+
+FOR /F "tokens=2 delims==" %%I IN ('wmic datafile where name^="%DEST_FILE:\=\\%" get Version /value 2^>nul') DO (
+    SET DEST_VER=%%I
+)
+
+IF "%SRC_VER%"=="" (
+    ECHO Copying %~nx1 (no version info) >> %LOG_FILE%
+    COPY /Y "%SRC_FILE%" "%DEST_FILE%" > nul
+) ELSE (
+    IF "%SRC_VER%" GTR "%DEST_VER%" (
+        ECHO Copying newer version of %~nx1: %SRC_VER% ^> %DEST_VER% >> %LOG_FILE%
+        COPY /Y "%SRC_FILE%" "%DEST_FILE%" > nul
+    ) ELSE (
+        ECHO %~nx1 is up to date >> %LOG_FILE%
+    )
+)
+
+GOTO :EOF
+
+:END
+DEL /F /Q %TEMP_FILE% 2>NUL
+ENDLOCAL
